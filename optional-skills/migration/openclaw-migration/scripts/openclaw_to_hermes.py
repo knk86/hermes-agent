@@ -890,14 +890,20 @@ class Migrator:
             self.record("command-allowlist", source, destination, "migrated", "Would merge patterns", added_patterns=added)
 
     def load_openclaw_config(self) -> Dict[str, Any]:
-        config_path = self.source_root / "openclaw.json"
-        if not config_path.exists():
-            return {}
-        try:
-            data = json.loads(config_path.read_text(encoding="utf-8"))
-            return data if isinstance(data, dict) else {}
-        except json.JSONDecodeError:
-            return {}
+        # Check current name and legacy config filenames
+        for name in ("openclaw.json", "clawdbot.json", "moldbot.json"):
+            config_path = self.source_root / name
+            if config_path.exists():
+                try:
+                    data = json.loads(config_path.read_text(encoding="utf-8"))
+                    return data if isinstance(data, dict) else {}
+                except json.JSONDecodeError:
+                    continue
+        return {}
+
+    def load_openclaw_env(self) -> Dict[str, str]:
+        """Load the OpenClaw .env file for secrets that live there instead of config."""
+        return parse_env_file(self.source_root / ".env")
 
     def merge_env_values(self, additions: Dict[str, str], kind: str, source: Path) -> None:
         destination = self.target_root / ".env"
@@ -1170,6 +1176,47 @@ class Migrator:
                 if isinstance(oai_key, str) and oai_key.strip():
                     secret_additions["VOICE_TOOLS_OPENAI_KEY"] = oai_key.strip()
 
+        # Also check the OpenClaw .env file — many users store keys there
+        # instead of inline in openclaw.json
+        openclaw_env = self.load_openclaw_env()
+        env_key_mapping = {
+            "OPENROUTER_API_KEY": "OPENROUTER_API_KEY",
+            "OPENAI_API_KEY": "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY": "ANTHROPIC_API_KEY",
+            "ELEVENLABS_API_KEY": "ELEVENLABS_API_KEY",
+            "TELEGRAM_BOT_TOKEN": "TELEGRAM_BOT_TOKEN",
+            "DEEPSEEK_API_KEY": "DEEPSEEK_API_KEY",
+            "GEMINI_API_KEY": "GEMINI_API_KEY",
+            "ZAI_API_KEY": "ZAI_API_KEY",
+            "MINIMAX_API_KEY": "MINIMAX_API_KEY",
+        }
+        for oc_key, hermes_key in env_key_mapping.items():
+            val = openclaw_env.get(oc_key, "").strip()
+            if val and hermes_key not in secret_additions:
+                secret_additions[hermes_key] = val
+
+        # Check per-agent auth-profiles.json for additional credentials
+        auth_profiles_path = self.source_root / "agents" / "main" / "agent" / "auth-profiles.json"
+        if auth_profiles_path.exists():
+            try:
+                profiles = json.loads(auth_profiles_path.read_text(encoding="utf-8"))
+                if isinstance(profiles, dict):
+                    for profile_name, profile_data in profiles.items():
+                        if not isinstance(profile_data, dict):
+                            continue
+                        api_key = profile_data.get("apiKey", "")
+                        if not isinstance(api_key, str) or not api_key.strip():
+                            continue
+                        name_lower = profile_name.lower()
+                        if "openrouter" in name_lower and "OPENROUTER_API_KEY" not in secret_additions:
+                            secret_additions["OPENROUTER_API_KEY"] = api_key.strip()
+                        elif "openai" in name_lower and "OPENAI_API_KEY" not in secret_additions:
+                            secret_additions["OPENAI_API_KEY"] = api_key.strip()
+                        elif "anthropic" in name_lower and "ANTHROPIC_API_KEY" not in secret_additions:
+                            secret_additions["ANTHROPIC_API_KEY"] = api_key.strip()
+            except (json.JSONDecodeError, OSError):
+                pass
+
         if secret_additions:
             self.merge_env_values(secret_additions, "provider-keys", self.source_root / "openclaw.json")
         else:
@@ -1298,15 +1345,29 @@ class Migrator:
             self.record("tts-config", source_path, destination, "migrated", "Would set TTS config", settings=list(tts_data.keys()))
 
     def migrate_shared_skills(self) -> None:
-        source_root = self.source_root / "skills"
+        # Check all OpenClaw skill sources: managed, personal, project-level
+        skill_sources = [
+            (self.source_root / "skills", "shared-skills", "managed skills"),
+            (Path.home() / ".agents" / "skills", "personal-skills", "personal cross-project skills"),
+            (self.source_root / "workspace" / ".agents" / "skills", "project-skills", "project-level shared skills"),
+            (self.source_root / "workspace.default" / ".agents" / "skills", "project-skills", "project-level shared skills"),
+        ]
+        found_any = False
+        for source_root, kind_label, desc in skill_sources:
+            if source_root.exists():
+                found_any = True
+                self._import_skill_directory(source_root, kind_label, desc)
+        if not found_any:
+            destination_root = self.target_root / "skills" / SKILL_CATEGORY_DIRNAME
+            self.record("shared-skills", None, destination_root, "skipped", "No shared OpenClaw skills directories found")
+
+    def _import_skill_directory(self, source_root: Path, kind_label: str, desc: str) -> None:
+        """Import skills from a single source directory into openclaw-imports."""
         destination_root = self.target_root / "skills" / SKILL_CATEGORY_DIRNAME
-        if not source_root.exists():
-            self.record("shared-skills", None, destination_root, "skipped", "No shared OpenClaw skills directory found")
-            return
 
         skill_dirs = [p for p in sorted(source_root.iterdir()) if p.is_dir() and (p / "SKILL.md").exists()]
         if not skill_dirs:
-            self.record("shared-skills", source_root, destination_root, "skipped", "No shared skills with SKILL.md found")
+            self.record(kind_label, source_root, destination_root, "skipped", f"No skills with SKILL.md found in {desc}")
             return
 
         for skill_dir in skill_dirs:
@@ -1314,7 +1375,7 @@ class Migrator:
             final_destination = destination
             if destination.exists():
                 if self.skill_conflict_mode == "skip":
-                    self.record("shared-skill", skill_dir, destination, "conflict", "Destination skill already exists")
+                    self.record(kind_label, skill_dir, destination, "conflict", "Destination skill already exists")
                     continue
                 if self.skill_conflict_mode == "rename":
                     final_destination = self.resolve_skill_destination(destination)
@@ -1329,19 +1390,19 @@ class Migrator:
                 details: Dict[str, Any] = {"backup": str(backup_path) if backup_path else ""}
                 if final_destination != destination:
                     details["renamed_from"] = str(destination)
-                self.record("shared-skill", skill_dir, final_destination, "migrated", **details)
+                self.record(kind_label, skill_dir, final_destination, "migrated", **details)
             else:
                 if final_destination != destination:
                     self.record(
-                        "shared-skill",
+                        kind_label,
                         skill_dir,
                         final_destination,
                         "migrated",
-                        "Would copy shared skill directory under a renamed folder",
+                        f"Would copy {desc} directory under a renamed folder",
                         renamed_from=str(destination),
                     )
                 else:
-                    self.record("shared-skill", skill_dir, final_destination, "migrated", "Would copy shared skill directory")
+                    self.record(kind_label, skill_dir, final_destination, "migrated", f"Would copy {desc} directory")
 
         desc_path = destination_root / "DESCRIPTION.md"
         if self.execute:
@@ -1518,6 +1579,7 @@ class Migrator:
             self.source_candidate("workspace/IDENTITY.md", "workspace.default/IDENTITY.md"),
             self.source_candidate("workspace/TOOLS.md", "workspace.default/TOOLS.md"),
             self.source_candidate("workspace/HEARTBEAT.md", "workspace.default/HEARTBEAT.md"),
+            self.source_candidate("workspace/BOOTSTRAP.md", "workspace.default/BOOTSTRAP.md"),
         ]
         for candidate in candidates:
             if candidate:
